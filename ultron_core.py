@@ -388,3 +388,291 @@ def scaffold_project(name: str, stack: str, destination: str, description: str =
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
     return {"project": str(root), "stack": stack, "files": sorted(tables[stack])}
+
+# ------------------------------------------------------- ULTRON modes ----
+# Register these functions as MCP tools in server.py.
+
+
+def deep_dive(topic: str, path: str = "") -> dict:
+    """Build a detailed, implementation-oriented analysis brief for a topic."""
+    topic = (topic or "").strip()
+    if not topic:
+        raise UltronError("Provide a topic for deep analysis.")
+    result = {
+        "mode": "ULTRON_DEEP=TRUE",
+        "topic": topic[:500],
+        "analysis_framework": [
+            "Define the concept and the problem it solves.",
+            "Explain the underlying mechanism step by step.",
+            "Identify components, interfaces, state, and data flow.",
+            "Compare viable designs and state trade-offs.",
+            "Cover failure modes, security risks, performance, and scaling.",
+            "Provide a concrete example and implementation plan.",
+            "List assumptions and tests that would validate the design.",
+        ],
+        "response_instruction": (
+            "Produce a detailed technical explanation using the framework above. "
+            "Separate established facts from assumptions; include examples and edge cases."
+        ),
+    }
+    if path.strip():
+        result["project_context"] = scan_project(path)
+    return result
+
+
+_SECRET_PATTERNS = [
+    ("private key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+    ("AWS access key ID", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("generic credential assignment", re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|passwd)\b\s*[:=]\s*['\"]?[^'\"\s]{8,}"
+    )),
+]
+
+
+def secrets_audit(path: str = ".") -> dict:
+    """Find likely hard-coded secrets; never return matched values or file contents."""
+    root = _safe(path)
+    _require_dir(root)
+    findings = []
+    scanned = 0
+    for file_path in _iter_files(root):
+        try:
+            if file_path.stat().st_size > 2 * 1024 * 1024:
+                continue
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, UnicodeError):
+            continue
+        scanned += 1
+        for line_no, line in enumerate(content.splitlines(), 1):
+            for label, pattern in _SECRET_PATTERNS:
+                if pattern.search(line):
+                    findings.append({
+                        "file": file_path.relative_to(root).as_posix(),
+                        "line": line_no,
+                        "type": label,
+                        "value": "[REDACTED]",
+                    })
+                    break
+            if len(findings) >= LIST_CAP:
+                break
+        if len(findings) >= LIST_CAP:
+            break
+    return {
+        "mode": "ULTRON_HUSH=true",
+        "root": str(root),
+        "files_scanned": scanned,
+        "finding_count": len(findings),
+        "findings": findings,
+        "note": "Matches are heuristic. Values and source lines are deliberately not returned.",
+    }
+
+
+def architecture(path: str = ".", write: bool = False, overwrite: bool = False) -> dict:
+    """Create a Mermaid architecture blueprint from the project structure."""
+    root = _safe(path)
+    _require_dir(root)
+    scan = scan_project(str(root))
+    modules = scan["blueprint"][:12]
+    lines = ["flowchart TD", '    A["Application / Repository"]']
+    for index, module in enumerate(modules, 1):
+        safe_id = f"M{index}"
+        label = module["module"].replace('"', "'")[:70]
+        lines.append(f'    {safe_id}["{label}<br/>{module["files"]} files"]')
+        lines.append(f"    A --> {safe_id}")
+    if scan["entrypoints"]:
+        lines.append('    E["Entry points"]')
+        lines.append("    A --> E")
+        for index, entry in enumerate(scan["entrypoints"][:8], 1):
+            label = entry.replace('"', "'")[:70]
+            lines.append(f'    E --> EP{index}["{label}"]')
+    diagram = "\n".join(lines) + "\n"
+    markdown = (
+        "# Architecture Blueprint\n\n"
+        f"- Root: `{root}`\n"
+        f"- Files scanned: {scan['file_count']}\n"
+        f"- Languages: {', '.join(scan['languages']) or 'Not detected'}\n"
+        f"- Stack markers: {', '.join(scan['stack']) or 'Not detected'}\n\n"
+        "```mermaid\n" + diagram + "```\n"
+    )
+    output_path = root / "ARCHITECTURE.md"
+    written = False
+    if write:
+        if output_path.exists() and not overwrite:
+            raise UltronError("ARCHITECTURE.md already exists. Set overwrite=true to replace it.")
+        output_path.write_text(markdown, encoding="utf-8")
+        written = True
+    return {
+        "mode": "ULTRON_ARC=true",
+        "root": str(root),
+        "diagram_format": "Mermaid",
+        "diagram": diagram,
+        "summary": {
+            "file_count": scan["file_count"],
+            "languages": scan["languages"],
+            "stack": scan["stack"],
+            "entrypoints": scan["entrypoints"][:20],
+        },
+        "written": written,
+        "output": str(output_path) if written else None,
+        "markdown": markdown[:12000],
+    }
+
+
+# Local-only browser IDE. Edits are held in the browser textarea and never saved.
+_IDE_SERVERS = {}
+_IDE_LOCK = __import__("threading").Lock()
+_IDE_MAX_READ = 1024 * 1024
+
+
+def ide(path: str = ".", port: int = 5000, stop: bool = False) -> dict:
+    """Start/stop a local browser IDE. Edits remain in browser memory and are not saved."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+    import threading
+
+    if not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise UltronError("port must be an integer between 1024 and 65535.")
+    root = _safe(path)
+    _require_dir(root)
+    key = (str(root), port)
+
+    with _IDE_LOCK:
+        existing = _IDE_SERVERS.get(key)
+        if stop:
+            if not existing:
+                return {"stopped": False, "message": "No IDE server was registered for this workspace and port."}
+            existing.shutdown()
+            existing.server_close()
+            _IDE_SERVERS.pop(key, None)
+            return {"stopped": True, "port": port}
+        if existing:
+            return {"running": True, "url": f"http://127.0.0.1:{port}", "root": str(root),
+                    "message": "IDE is already running."}
+
+        page = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ULTRON IDE</title><style>
+:root{color-scheme:dark;font:14px system-ui;background:#10131a;color:#e8edf5}*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;flex-direction:column}header{padding:12px 18px;background:#191f2b;border-bottom:1px solid #30394a;display:flex;gap:14px;align-items:center}
+header strong{letter-spacing:2px;color:#8bd5ff}#status{color:#9aa9bd;font-size:12px}main{display:grid;grid-template-columns:260px 1fr;flex:1;min-height:0}
+aside{overflow:auto;border-right:1px solid #30394a;padding:12px}button{background:#1b2330;border:1px solid #354156;color:#e8edf5;padding:7px 10px;border-radius:6px;cursor:pointer}
+.file{display:block;width:100%;text-align:left;margin:4px 0;overflow-wrap:anywhere}.file:hover,button:hover{border-color:#8bd5ff}section{display:flex;flex-direction:column;min-width:0}
+#filename{padding:10px 14px;background:#151b25;color:#8bd5ff}textarea{resize:none;flex:1;width:100%;border:0;outline:0;background:#0d1117;color:#dbe7f5;padding:18px;font:13px/1.6 Consolas,monospace;tab-size:4}
+footer{padding:8px 14px;background:#191f2b;color:#9aa9bd;font-size:12px}@media(max-width:650px){main{grid-template-columns:145px 1fr}aside{padding:6px}.file{font-size:11px;padding:6px}}
+</style></head><body><header><strong>ULTRON // IDE</strong><span id="status">LOCAL WORKSPACE</span><button id="reset">Reload file</button></header>
+<main><aside id="files">Loading workspace…</aside><section><div id="filename">Select a file</div><textarea id="editor" spellcheck="false" aria-label="Session-only code editor" placeholder="Choose a file from the explorer…"></textarea>
+<footer>Session-only editor · Changes are not written to disk · Code execution disabled</footer></section></main>
+<script>let current='',original='';const $=id=>document.getElementById(id);
+async function list(){const r=await fetch('/api/files');const d=await r.json();$('files').innerHTML='';if(!r.ok){$('files').textContent=d.error||'Unable to list files';return}
+d.files.forEach(f=>{const b=document.createElement('button');b.className='file';b.textContent=f;b.onclick=()=>openFile(f);$('files').appendChild(b)})}
+async function openFile(f){const r=await fetch('/api/read?path='+encodeURIComponent(f));const d=await r.json();if(!r.ok){$('status').textContent=d.error||'Read failed';return}
+current=f;original=d.content;$('filename').textContent=f;$('editor').value=original;$('status').textContent='SESSION EDIT · NOT SAVED'}
+$('reset').onclick=()=>{$('editor').value=original;$('status').textContent='Reverted to disk version'};list();</script></body></html>'''
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def _send(self, status, body, content_type="application/json; charset=utf-8"):
+                payload = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                if parsed.path == "/":
+                    self._send(200, page, "text/html; charset=utf-8")
+                    return
+                if parsed.path == "/api/files":
+                    files = []
+                    for f in _iter_files(root):
+                        try:
+                            rel = f.relative_to(root).as_posix()
+                            if f.stat().st_size <= _IDE_MAX_READ:
+                                files.append(rel)
+                        except OSError:
+                            continue
+                        if len(files) >= LIST_CAP:
+                            break
+                    self._send(200, json.dumps({"files": files}))
+                    return
+                if parsed.path == "/api/read":
+                    rel = parse_qs(parsed.query).get("path", [""])[0]
+                    candidate = (root / rel).resolve()
+                    if candidate != root and root not in candidate.parents:
+                        self._send(403, json.dumps({"error": "Path is outside the IDE workspace."}))
+                        return
+                    if not candidate.is_file() or candidate.is_symlink() or _skip_file(candidate.name):
+                        self._send(404, json.dumps({"error": "File not found or not readable."}))
+                        return
+                    try:
+                        if candidate.stat().st_size > _IDE_MAX_READ:
+                            self._send(413, json.dumps({"error": "File exceeds 1 MB read limit."}))
+                            return
+                        content = candidate.read_text(encoding="utf-8")
+                    except (OSError, UnicodeError):
+                        self._send(415, json.dumps({"error": "File is not readable UTF-8 text."}))
+                        return
+                    self._send(200, json.dumps({"path": rel, "content": content}))
+                    return
+                self._send(404, json.dumps({"error": "Not found."}))
+
+            def do_POST(self):
+                self._send(405, json.dumps({"error": "Writes and code execution are disabled."}))
+
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        except OSError as exc:
+            raise UltronError(f"Could not start IDE on 127.0.0.1:{port}: {exc}") from exc
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, name=f"ultron-ide-{port}", daemon=True)
+        _IDE_SERVERS[key] = server
+        thread.start()
+    return {"running": True, "url": f"http://127.0.0.1:{port}", "host": "127.0.0.1", "root": str(root),
+            "editable": True, "persistence": "session-only; no disk writes", "execution": "disabled"}
+
+
+ULTRON_COMMANDS = {
+    "ULTRON_DEEP=TRUE": "Call ultron_deep_analysis(topic, path?) for implementation-level concept exploration.",
+    "ULTRON_HUSH=true": "Call ultron_hush(path?) to audit for likely secrets; returned values are always redacted.",
+    "ULTRON_ARC=true": "Call ultron_architecture(path?, write?, overwrite?) for a Mermaid architecture blueprint.",
+    "ULTRON_IDE=TRUE": "Call ultron_ide_start(path?, port=5000, stop?) to launch the local session-only browser IDE.",
+}
+
+
+def ultron_command_help() -> dict:
+    """Describe supported ULTRON command triggers and their corresponding MCP tools."""
+    return {"commands": ULTRON_COMMANDS, "default_workspace": str(WORKSPACE)}
+
+
+
+def ultron_mode(
+    command: str,
+    topic: str = "",
+    path: str = ".",
+    port: int = 5000,
+    write: bool = False,
+    overwrite: bool = False,
+    stop: bool = False,
+) -> dict:
+    """Dispatch one of the four explicit ULTRON command strings to its feature."""
+    normalized = (command or "").strip().upper()
+    if normalized == "ULTRON_DEEP=TRUE":
+        return deep_dive(topic, path if path and path != "." else "")
+    if normalized == "ULTRON_HUSH=TRUE":
+        return secrets_audit(path)
+    if normalized == "ULTRON_ARC=TRUE":
+        return architecture(path, write=write, overwrite=overwrite)
+    if normalized == "ULTRON_IDE=TRUE":
+        return ide(path, port=port, stop=stop)
+    raise UltronError(
+        "Unknown ULTRON command. Use ULTRON_DEEP=TRUE, ULTRON_HUSH=true, "
+        "ULTRON_ARC=true, or ULTRON_IDE=TRUE."
+    )
